@@ -1,0 +1,244 @@
+# read data
+train_ross<-fread("train.csv", header = TRUE)
+store_ross<-fread("store.csv", header = TRUE)
+test_ross<-fread("test.csv", header = TRUE)
+
+store_full<-merge(train_ross, store_ross, by="Store", all.x = TRUE)
+
+store=store_full[,.(Store=Store,
+                    weekday=DayOfWeek,
+                    Date=as.Date(Date),
+                    Sales=Sales,
+                    Open=Open,
+                    Promo=as.factor(Promo),
+                    Promo2=as.factor(Promo2),
+                    Holiday=as.factor(StateHoliday),
+                    Year=as.numeric(format(as.Date(Date), '%Y')),
+                    Month=as.numeric(format(as.Date(Date), '%m')),
+                    Week=as.numeric(format(as.Date(Date), '%W')),
+                    Day=as.numeric(format(as.Date(Date), '%d')),
+                    Assortment=as.factor(Assortment),
+                    Compdist=as.numeric(CompetitionDistance),
+                    Schoolholiday=as.factor(SchoolHoliday))]
+
+test_kaggle=test_ross[,.(Id = Id,
+                         Store=Store,
+                         weekday=DayOfWeek,
+                         Date=as.Date(Date),
+                         Open=Open,
+                         Promo=as.factor(Promo),
+                         Holiday=as.factor(StateHoliday),
+                         Year=as.numeric(format(as.Date(Date), '%Y')),
+                         Month=as.numeric(format(as.Date(Date), '%m')),
+                         Week=as.numeric(format(as.Date(Date), '%W')),
+                         Day=as.numeric(format(as.Date(Date), '%d')),
+                         Schoolholiday=as.factor(SchoolHoliday))]
+
+store$Compdist[is.na(store$Compdist)] <- as.numeric(99999)
+
+
+
+
+## test/train eigen ##
+store_red<-subset(store, Store %in% 1:100)
+#store_red<-store_red[Sales>0]
+
+testset<-store_red[Date %between% c("2015-06-14", "2015-07-31")]
+trainset<-store_red[Date %between% c("2013-01-01", "2015-06-13")]
+
+testset_fin <- testset[,-c("Date","Sales")]
+trainset_fin <- trainset[,-c("Date")]
+
+
+
+
+#h2o.init()
+h2o.init(nthreads = -1, max_mem_size = '2g', ip = "127.0.0.1", port = 50001)
+
+train.h20 <- as.h2o(trainset_fin)
+test.h20 <- as.h2o(testset_fin)
+
+y <- "Sales"
+#x <- setdiff(names(train), y)
+
+aml <- h2o.automl(y = y,
+                  training_frame = train.h20,
+                  max_runtime_secs = 120,
+                  seed = 1)
+
+lb <- aml@leaderboard
+
+pred_aml <- h2o.predict(aml@leader, test.h20)
+
+pred_aml<-as.data.frame(pred_aml)
+
+testset_h2o<-cbind(testset_fin, pred_aml)
+
+outf<-data.frame(Date=testset$Date,
+                 weekday=testset$weekday,
+                 Store=testset_h2o$Store, 
+                 Sales=testset$Sales, 
+                 Prediction_h2o=testset_h2o$predict)
+
+# Auto.Arima with covariates
+
+df<-trainset%>%select(Date, Store, Sales)
+xtrain<-trainset%>%select(Date, Store, Promo)
+xtest<-testset%>%select(Date, Store, Promo)
+
+#spread by Store
+df_spre<- spread(df, Store, Sales)
+xtrain_spre<-spread(xtrain, Store, Promo)
+xtest_spre<-spread(xtest, Store, Promo)
+
+# convert to ts()
+#df_ts <- ts(df_spre[,-1],f=30,s=2013/12)
+df_ts<-ts(df_spre[,-1], start = c(2013,7), frequency = 7) # because of the weekly seasonality https://robjhyndman.com/hyndsight/seasonal-periods/ 
+
+xmat_train<-data.matrix(xtrain_spre)
+xmat_train <- xmat_train[,-1]
+xmat_train<-xmat_train[,1]
+xmat_test<-data.matrix(xtest_spre)
+xmat_test <- xmat_test[,-1]
+xmat_test<-xmat_test[,1]
+
+#fit <- auto.arima(df_ts[,"Sales"], xreg = xmat_train)
+#fca <- forecast(fit, xreg = xmat_test)
+
+
+#df_ts_omna<-na.remove(df_ts) # instead of na.omit which desnt work with ts - disabled as xreg is longer than df_ts, when included na-remove should also be applied to xreg
+
+# loop trough list
+ns <- ncol(df_ts)
+h <- 48
+fcast <- matrix(NA,nrow=h,ncol=ns)
+
+
+# with covariates
+for(i in 1:ns)
+  fcast[,i] <- forecast(auto.arima(df_ts[,i], xreg = xmat_train), h=h, xreg = xmat_test)$mean
+
+# or see: https://stackoverflow.com/questions/32001107/auto-arima-loop-and-forecast 
+
+
+#gather by Store
+df_ga<-as.data.frame(fcast)
+df_ga<- gather(df_ga, key="Store", value = "Forecast_auto.arima")
+df_ga$Store<-substr(df_ga$Store, 2,4)
+df_ga$Store<-as.numeric(df_ga$Store)
+df_ga_cov<-df_ga
+
+
+## Prophete ##
+#library(prophet)
+
+# prepare schoolholidays & promo
+# store1<-store[Store==1]
+# sh<-store1[Schoolholiday==1, list(Date, Schoolholiday)]
+# setcolorder(sh, rev(names(sh)))
+# setnames(sh, old=c("Schoolholiday", "Date"), new=c("holiday", "ds"))
+# levels(sh$holiday)[levels(sh$holiday)==1] <- "Schoolholiday"
+
+
+# prepare data & Regressors
+df_reg<-trainset%>%select(Date, Store, Sales, Compdist, Promo, Promo2, Open, Assortment, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday)
+df_fb<-rename(df_reg, c("Date"="ds", "Sales" = "y"))
+df_list <- split(df_fb, df_fb$Store)
+cova_fu<-store_red%>%select(Store, Compdist, Promo, Promo2, Open, Assortment, Monday, Tuesday, Wednesday, Thursday, Friday, Saturday, Sunday)
+cova_fu_list <- split(cova_fu, cova_fu$Store)
+
+df_list<-map(df_list, ~ (.x %>% select(-Store)))
+
+#m_list <- map(df_list, prophet, holidays = sh, weekly.seasonality = TRUE, fit=FALSE) # prophet call
+m_list <- map(df_list, prophet, weekly.seasonality = TRUE, fit=FALSE) # prophet call
+
+m_list <- map(m_list, add_regressor, name = "Compdist")
+m_list <- map(m_list, add_regressor, name = "Promo")
+m_list <- map(m_list, add_regressor, name = "Promo2")
+m_list <- map(m_list, add_regressor, name = "Open")
+m_list <- map(m_list, add_regressor, name = "Monday")
+m_list <- map(m_list, add_regressor, name = "Tuesday")
+m_list <- map(m_list, add_regressor, name = "Wednesday")
+m_list <- map(m_list, add_regressor, name = "Thursday")
+m_list <- map(m_list, add_regressor, name = "Friday")
+m_list <- map(m_list, add_regressor, name = "Saturday")
+m_list <- map(m_list, add_regressor, name = "Sunday")
+
+m_list <- map2(m_list, df_list, fit.prophet)
+
+future_list <- map(m_list, make_future_dataframe, periods = 48) # makes future obs
+
+future_list <- map2(future_list, cova_fu_list, cbind)
+
+forecast_list <- map2(m_list, future_list, predict)
+
+
+hh<-rbindlist(forecast_list)
+final_prophet<-hh[hh$ds >= "2015-06-14",]
+final_prophet2<-final_prophet%>%select(ds, yhat)
+
+out_final<-cbind(outf, df_ga_wo$Forecast_auto.arima, df_ga_cov$Forecast_auto.arima, final_prophet$yhat)
+
+# reverse order of forecast from ARIMA and Prophet
+frev<-out_final
+frev=frev %>% 
+  group_by(Store) %>%
+  do(frev[nrow(frev):1,])
+
+frevv<-frev
+by_store<-frevv %>% group_by(Store)
+fg<-by_store %>% arrange(Store)
+
+fina=fg %>% distinct(Date, Store, final_prophet.yhat, df_ga_cov.Forecast_auto.arima, df_ga_wo.Forecast_auto.arima)
+out<-data.frame(Date=out_final$Date, 
+                Weekday=out_final$weekday, 
+                Store=out_final$Store, 
+                Sales=out_final$Sales, 
+                Pred_h20=out_final$Prediction_h2o,
+                Pred_h20_all=h2o_all$Prediction_h2o_all,
+                Pred_AA=fina$df_ga_wo.Forecast_auto.arima, 
+                Pred_AA_Cov=fina$df_ga_cov.Forecast_auto.arima,
+                Pred_Prophet=fina$final_prophet.yhat)
+
+out$Pred_Prophet[out$Pred_Prophet <0] <- 0
+out$Pred_AA_Cov[out$Pred_AA_Cov <0] <- 0
+out$Pred_AA[out$Pred_AA <0] <- 0
+out<-subset(out, Store %in% 1:987)
+
+# Analyze test error
+out_zero<-out[Sales!=0]
+
+out_zero$RMSPE_error_h2o<-((out_zero$Sales-out_zero$Pred_h20)/out_zero$Sales)^2
+out_zero$RMSPE_error_AA<-((out_zero$Sales-out_zero$Pred_AA)/out_zero$Sales)^2
+out_zero$RMSPE_error_AA_cov<-((out_zero$Sales-out_zero$Pred_AA_Cov)/out_zero$Sales)^2
+out_zero$RMSPE_error_prophet<-((out_zero$Sales-out_zero$Pred_Prophet)/out_zero$Sales)^2
+
+error_out_RMSPE<-out_zero[,list(RMSPE_h2o=sqrt(mean(RMSPE_error_h2o)),
+                                RMSPE_Auto.Arima=sqrt(mean(RMSPE_error_AA_cov)),
+                                RMSPE_Proph=sqrt(mean(RMSPE_error_prophet))),
+                                by = Store]
+
+error_out_MAPE<-out_zero[,list(MAPE_h2o=(mean((error_h2o)/Sales))*100,
+                               MAPE_Auto.Arima=(mean((error_AA_cov)/Sales))*100,
+                               MAPE_Proph=(mean((error_prophet)/Sales))*100),
+                               by = Store]
+
+as<-error_out_MAPE%>%select(Store, MAPE_h2o, MAPE_Auto.Arima, MAPE_Proph)
+cc<- gather(as, "Forecasting Method", "MAPE per Store", 2:4)
+cc$Error<-as.factor(cc$`MAPE per Store`)
+agg <- aggregate(cc, by = list(cc$`MAPE per Store`), FUN = mean)
+
+plot_MAPE <- ggplot(cc, aes(x=`Forecasting Method`, y=`MAPE per Store`)) + 
+             geom_boxplot(outlier.shape = NA) +
+             scale_y_continuous(limits = quantile(cc$`MAPE per Store`, c(0, 0.9)))
+plot_MAPE
+
+as<-error_out_RMSPE%>%select(Store, RMSPE_h2o, RMSPE_Auto.Arima, RMSPE_Proph)
+cc<- gather(as, "Forecasting Method", "RMSPE per Store", 2:4)
+cc$Error<-as.factor(cc$`RMSPE per Store`)
+agg <- aggregate(cc, by = list(cc$`RMSPE per Store`), FUN = mean)
+
+plot_RMSPE <- ggplot(cc, aes(x=`Forecasting Method`, y=`RMSPE per Store`)) + 
+              geom_boxplot(outlier.shape = NA) +
+              scale_y_continuous(limits = quantile(cc$`RMSPE per Store`, c(0, 0.9)))
+plot_RMSPE
