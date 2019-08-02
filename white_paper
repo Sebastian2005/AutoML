@@ -50,16 +50,13 @@ testset_fin <- testset[,-c("Date","Sales")]
 trainset_fin <- trainset[,-c("Date")]
 
 
-
-
-#h2o.init()
-h2o.init(nthreads = -1, max_mem_size = '2g', ip = "127.0.0.1", port = 50001)
+# AutoML H2O
+h2o.init()
 
 train.h20 <- as.h2o(trainset_fin)
 test.h20 <- as.h2o(testset_fin)
 
 y <- "Sales"
-#x <- setdiff(names(train), y)
 
 aml <- h2o.automl(y = y,
                   training_frame = train.h20,
@@ -118,15 +115,12 @@ fcast <- matrix(NA,nrow=h,ncol=ns)
 for(i in 1:ns)
   fcast[,i] <- forecast(auto.arima(df_ts[,i], xreg = xmat_train), h=h, xreg = xmat_test)$mean
 
-# or see: https://stackoverflow.com/questions/32001107/auto-arima-loop-and-forecast 
-
 
 #gather by Store
 df_ga<-as.data.frame(fcast)
 df_ga<- gather(df_ga, key="Store", value = "Forecast_auto.arima")
 df_ga$Store<-substr(df_ga$Store, 2,4)
 df_ga$Store<-as.numeric(df_ga$Store)
-df_ga_cov<-df_ga
 
 
 ## Prophete ##
@@ -177,7 +171,7 @@ hh<-rbindlist(forecast_list)
 final_prophet<-hh[hh$ds >= "2015-06-14",]
 final_prophet2<-final_prophet%>%select(ds, yhat)
 
-out_final<-cbind(outf, df_ga_wo$Forecast_auto.arima, df_ga_cov$Forecast_auto.arima, final_prophet$yhat)
+out_final<-cbind(outf, df_ga$Forecast_auto.arima, final_prophet$yhat)
 
 # reverse order of forecast from ARIMA and Prophet
 frev<-out_final
